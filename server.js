@@ -15,6 +15,7 @@ const PORT = process.env.PORT || 5000;
 const AUTH_SECRET = process.env.AUTH_SECRET || "tufto-rino-admin-secret";
 const ADMIN_STATUS_VALUES = new Set(["pending", "paid", "shipped"]);
 const CONVERSATION_STATUS_VALUES = new Set(["open", "pending", "closed"]);
+const DEFAULT_BACKEND_URL = `http://localhost:${PORT}`;
 const uploadsRoot = path.join(__dirname, "uploads");
 const customRequestUploadsDir = path.join(uploadsRoot, "custom-requests");
 const messageUploadsDir = path.join(uploadsRoot, "messages");
@@ -23,6 +24,45 @@ const productUploadsDir = path.join(uploadsRoot, "products");
 fs.mkdirSync(customRequestUploadsDir, { recursive: true });
 fs.mkdirSync(messageUploadsDir, { recursive: true });
 fs.mkdirSync(productUploadsDir, { recursive: true });
+
+function normalizeBaseUrl(url) {
+  const value = String(url || "").trim();
+  return value ? value.replace(/\/+$/, "") : "";
+}
+
+function getPublicBaseUrl() {
+  return normalizeBaseUrl(process.env.BACKEND_URL || process.env.BASE_URL) || DEFAULT_BACKEND_URL;
+}
+
+function buildPublicFileUrl(filePath) {
+  if (!filePath) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(filePath)) {
+    return filePath;
+  }
+
+  const normalizedPath = filePath.startsWith("/") ? filePath : `/${filePath}`;
+  return `${getPublicBaseUrl()}${normalizedPath}`;
+}
+
+function getAllowedOrigins() {
+  const envOrigins = String(process.env.CORS_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  return new Set(
+    [
+      "http://localhost:5173",
+      "http://127.0.0.1:5173",
+      "https://tufto-rino-frontend.vercel.app",
+      normalizeBaseUrl(process.env.FRONTEND_URL),
+      ...envOrigins.map(normalizeBaseUrl),
+    ].filter(Boolean)
+  );
+}
 
 const customRequestStorage = multer.diskStorage({
   destination: (req, file, callback) => {
@@ -112,13 +152,17 @@ const uploadProductImage = multer({
   },
 });
 
+app.set("trust proxy", 1);
 app.use(
   cors({
-    origin: [
-      "http://localhost:5173",
-      "https://tufto-rino-frontend.vercel.app",
-      "https://tufto-rino-frontend-j1v56bbxy-lamdidiismail-a11ys-projects.vercel.app"
-    ],
+    origin(origin, callback) {
+      if (!origin || getAllowedOrigins().has(normalizeBaseUrl(origin))) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error("Origin not allowed by CORS"));
+    },
     credentials: false,
   })
 );
@@ -127,9 +171,6 @@ app.use("/uploads", express.static(uploadsRoot));
 
 console.log("✅ ROUTES LOADED FROM THIS server.js");
 
-app.get("/api/test-route", (req, res) => {
-  res.json({ success: true, message: "Backend OK" });
-});
 
 app.get("/api/categories", async (req, res) => {
   try {
@@ -153,13 +194,7 @@ app.get("/api/categories", async (req, res) => {
 const asyncHandler =
   (handler) =>
   (req, res, next) =>
-    Promise.resolve(handler(req, res, next)).catch((error) => {
-      console.error(error);
-      res.status(500).json({
-        success: false,
-        message: "Server error",
-      });
-    });
+    Promise.resolve(handler(req, res, next)).catch(next);
 
 function createAuthToken(user) {
   const payload = {
@@ -337,7 +372,7 @@ function normalizeCustomRequest(row) {
     budget: row.budget || "",
     phone: row.phone || "",
     image: storedImage,
-    imageUrl: storedImage ? `http://localhost:${PORT}${storedImage}` : null,
+    imageUrl: buildPublicFileUrl(storedImage),
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at || row.created_at,
@@ -417,7 +452,7 @@ function attachMessageAttachments(messages, attachments) {
       filename: attachment.filename || path.basename(attachment.file_path || ""),
       mimeType: attachment.mime_type || "application/octet-stream",
       createdAt: attachment.created_at,
-      url: attachment.file_path ? `http://localhost:${PORT}${attachment.file_path}` : null,
+      url: buildPublicFileUrl(attachment.file_path),
     };
 
     if (!accumulator.has(attachment.message_id)) {
@@ -444,9 +479,9 @@ function normalizeProduct(product) {
     rawImage && /^https?:\/\//i.test(rawImage)
       ? rawImage
       : rawImage && rawImage.startsWith("/uploads/")
-        ? `http://localhost:${PORT}${rawImage}`
+        ? buildPublicFileUrl(rawImage)
         : rawImage
-          ? `http://localhost:${PORT}/uploads/${rawImage}`
+          ? buildPublicFileUrl(`/uploads/${rawImage}`)
           : null;
   const categoryId = product.category_id ?? product.categoryId ?? null;
   const categoryName = product.category_name || product.categoryName || null;
@@ -485,6 +520,20 @@ const PRODUCT_SELECT_FIELDS = `
 
 async function ensureProductSchema() {
   await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS products (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      category_id INT NULL,
+      name VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      dimensions VARCHAR(255) NULL,
+      price DECIMAL(10, 2) NOT NULL DEFAULT 0,
+      image VARCHAR(255) NULL,
+      stock INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp()
+    )
+  `);
+
+  await dbPromise.query(`
     CREATE TABLE IF NOT EXISTS categories (
       id INT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(100) NOT NULL UNIQUE
@@ -501,6 +550,18 @@ async function ensureProductSchema() {
 
   if (!columnNames.has("dimensions")) {
     alterStatements.push("ADD COLUMN dimensions VARCHAR(255) NULL AFTER description");
+  }
+
+  if (!columnNames.has("image")) {
+    alterStatements.push("ADD COLUMN image VARCHAR(255) NULL AFTER price");
+  }
+
+  if (!columnNames.has("stock")) {
+    alterStatements.push("ADD COLUMN stock INT NOT NULL DEFAULT 0 AFTER image");
+  }
+
+  if (!columnNames.has("created_at")) {
+    alterStatements.push("ADD COLUMN created_at TIMESTAMP NOT NULL DEFAULT current_timestamp() AFTER stock");
   }
 
   if (alterStatements.length > 0) {
@@ -538,7 +599,46 @@ async function ensureCategorySeed() {
   }
 }
 
+async function ensureUserSchema() {
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      full_name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) NOT NULL UNIQUE,
+      password VARCHAR(255) NOT NULL,
+      role VARCHAR(30) NOT NULL DEFAULT 'client',
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp()
+    )
+  `);
+}
+
 async function ensureOrderSchema() {
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      order_type VARCHAR(50) NOT NULL DEFAULT 'catalog',
+      custom_request_id INT NULL,
+      total DECIMAL(10, 2) NOT NULL DEFAULT 0,
+      status VARCHAR(50) NOT NULL DEFAULT 'pending',
+      address TEXT NULL,
+      payment_method VARCHAR(50) NULL,
+      payment_status VARCHAR(50) NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp(),
+      updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+    )
+  `);
+
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS order_items (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      order_id INT NOT NULL,
+      product_id INT NOT NULL,
+      quantity INT NOT NULL DEFAULT 1,
+      price DECIMAL(10, 2) NOT NULL DEFAULT 0
+    )
+  `);
+
   const [columns] = await dbPromise.query("SHOW COLUMNS FROM orders");
   const columnNames = new Set(columns.map((column) => column.Field));
   const alterStatements = [];
@@ -563,6 +663,25 @@ async function ensureOrderSchema() {
 }
 
 async function ensureCustomRequestSchema() {
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS custom_requests (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      title VARCHAR(255) NOT NULL,
+      description TEXT NOT NULL,
+      dimensions VARCHAR(255) NULL,
+      colors VARCHAR(255) NULL,
+      budget VARCHAR(120) NULL,
+      phone VARCHAR(50) NULL,
+      image VARCHAR(255) NULL,
+      image_path VARCHAR(255) NULL,
+      status VARCHAR(50) NOT NULL DEFAULT 'pending',
+      conversation_id INT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp(),
+      updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+    )
+  `);
+
   const [columns] = await dbPromise.query("SHOW COLUMNS FROM custom_requests");
   const columnNames = new Set(columns.map((column) => column.Field));
   const alterStatements = [];
@@ -587,6 +706,10 @@ async function ensureCustomRequestSchema() {
     alterStatements.push("ADD COLUMN image VARCHAR(255) NULL AFTER phone");
   }
 
+  if (!columnNames.has("image_path")) {
+    alterStatements.push("ADD COLUMN image_path VARCHAR(255) NULL AFTER image");
+  }
+
   if (!columnNames.has("updated_at")) {
     alterStatements.push(
       "ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp() AFTER created_at"
@@ -603,6 +726,20 @@ async function ensureCustomRequestSchema() {
 }
 
 async function ensureConversationSchema() {
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      client_id INT NOT NULL,
+      admin_id INT NOT NULL,
+      subject VARCHAR(255) NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'open',
+      order_id INT NULL,
+      custom_request_id INT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp(),
+      updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+    )
+  `);
+
   const [columns] = await dbPromise.query("SHOW COLUMNS FROM conversations");
   const columnNames = new Set(columns.map((column) => column.Field));
   const alterStatements = [];
@@ -613,6 +750,14 @@ async function ensureConversationSchema() {
 
   if (!columnNames.has("status")) {
     alterStatements.push("ADD COLUMN status VARCHAR(30) NOT NULL DEFAULT 'open' AFTER subject");
+  }
+
+  if (!columnNames.has("order_id")) {
+    alterStatements.push("ADD COLUMN order_id INT NULL AFTER status");
+  }
+
+  if (!columnNames.has("custom_request_id")) {
+    alterStatements.push("ADD COLUMN custom_request_id INT NULL AFTER order_id");
   }
 
   if (!columnNames.has("updated_at")) {
@@ -627,12 +772,45 @@ async function ensureConversationSchema() {
 }
 
 async function ensureMessagesSchema() {
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      conversation_id INT NOT NULL,
+      sender_id INT NOT NULL,
+      sender_role VARCHAR(20) NULL,
+      message TEXT NULL,
+      message_type VARCHAR(20) NOT NULL DEFAULT 'text',
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp()
+    )
+  `);
+
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS carts (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp()
+    )
+  `);
+
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS cart_items (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      cart_id INT NOT NULL,
+      product_id INT NOT NULL,
+      quantity INT NOT NULL DEFAULT 1
+    )
+  `);
+
   const [columns] = await dbPromise.query("SHOW COLUMNS FROM messages");
   const columnNames = new Set(columns.map((column) => column.Field));
   const alterStatements = [];
 
   if (!columnNames.has("sender_role")) {
     alterStatements.push("ADD COLUMN sender_role VARCHAR(20) NULL AFTER sender_id");
+  }
+
+  if (!columnNames.has("message_type")) {
+    alterStatements.push("ADD COLUMN message_type VARCHAR(20) NOT NULL DEFAULT 'text' AFTER message");
   }
 
   if (alterStatements.length > 0) {
@@ -650,6 +828,18 @@ async function ensureMessagesSchema() {
 }
 
 async function ensureMessageAttachmentsSchema() {
+  await dbPromise.query(`
+    CREATE TABLE IF NOT EXISTS message_attachments (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      message_id INT NOT NULL,
+      file_path VARCHAR(255) NOT NULL,
+      filename VARCHAR(255) NULL,
+      mime_type VARCHAR(120) NULL,
+      file_size INT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT current_timestamp()
+    )
+  `);
+
   const [columns] = await dbPromise.query("SHOW COLUMNS FROM message_attachments");
   const columnNames = new Set(columns.map((column) => column.Field));
   const alterStatements = [];
@@ -1309,22 +1499,14 @@ app.get("/", (req, res) => {
   res.send("Backend khdam");
 });
 
-app.get("/api/test", (req, res) => {
-  res.json({ message: "Hello Ismail" });
+app.get("/api/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "Backend OK",
+    baseUrl: getPublicBaseUrl(),
+  });
 });
 
-app.get(
-  "/api/test-db",
-  asyncHandler(async (req, res) => {
-    const [result] = await dbPromise.query("SELECT 1 AS test");
-
-    res.json({
-      success: true,
-      message: "Connexion MySQL reussie",
-      result,
-    });
-  })
-);
 
 app.post(
   "/api/register",
@@ -1338,7 +1520,10 @@ app.post(
       });
     }
 
-    const [existingUsers] = await dbPromise.query("SELECT id FROM users WHERE email = ?", [email]);
+    const [existingUsers] = await dbPromise.query(
+      "SELECT id FROM users WHERE email = ?",
+      [email]
+    );
 
     if (existingUsers.length > 0) {
       return res.status(409).json({
@@ -1348,19 +1533,19 @@ app.post(
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+
     const [result] = await dbPromise.query(
       "INSERT INTO users (full_name, email, password, role) VALUES (?, ?, ?, ?)",
       [name, email, hashedPassword, "client"]
     );
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: "Registration successful",
       userId: result.insertId,
     });
   })
 );
-
 app.post(
   "/api/login",
   asyncHandler(async (req, res) => {
@@ -2264,28 +2449,6 @@ app.get(
   })
 );
 
-app.get("/api/test-route", (req, res) => {
-  res.json({ message: "Backend OK" });
-});
-
-app.get("/api/categories", async (req, res) => {
-  try {
-    const [categories] = await dbPromise.query(`
-      SELECT id, name
-      FROM categories
-      ORDER BY name ASC
-    `);
-
-    res.json(categories);
-  } catch (error) {
-    console.error("Erreur GET /api/categories:", error);
-    res.status(500).json({
-      success: false,
-      error: "Erreur serveur lors du chargement des catégories",
-      details: error.message,
-    });
-  }
-});
 
 app.get(
   "/api/products",
@@ -2566,6 +2729,7 @@ app.get(
 
 async function startServer() {
   try {
+    await ensureUserSchema();
     await ensureProductSchema();
     await ensureCategorySeed();
     await ensureOrderSchema();
@@ -2578,70 +2742,35 @@ async function startServer() {
   } catch (error) {
     console.error("Schema error:", error.message);
   }
-   app.post(
-  "/api/admin/custom-requests/:id/open-conversation",
-  requireAdmin,
-  asyncHandler(async (req, res) => {
-    const requestId = Number(req.params.id);
-
-    if (!requestId) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid custom request id",
-      });
-    }
-
-    const [[customRequest]] = await dbPromise.query(
-      `
-        SELECT 
-          cr.*,
-          u.full_name AS client_name,
-          u.email AS client_email
-        FROM custom_requests cr
-        LEFT JOIN users u ON u.id = cr.user_id
-        WHERE cr.id = ?
-        LIMIT 1
-      `,
-      [requestId]
-    );
-
-    if (!customRequest) {
-      return res.status(404).json({
-        success: false,
-        message: "Demande personnalisée introuvable",
-      });
-    }
-
-    if (customRequest.conversation_id) {
-      const conversation = await getConversationById(customRequest.conversation_id);
-
-      return res.json({
-        success: true,
-        conversation,
-        conversationId: customRequest.conversation_id,
-      });
-    }
-
-    const adminId = req.authUser?.id || (await getFirstAdminUserId());
-
-    const conversation = await createConversationRecord({
-      clientId: customRequest.user_id,
-      adminId,
-      subject: customRequest.title || "Demande personnalisée",
-      customRequestId: requestId,
-      status: "open",
-    });
-
-    res.status(201).json({
-      success: true,
-      conversation,
-      conversationId: conversation.id,
-    });
-  })
-);
   app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running on ${DEFAULT_BACKEND_URL}`);
   });
 }
 
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "Route API introuvable",
+  });
+});
+
+app.use((error, req, res, next) => {
+  console.error(error);
+
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+
+  const statusCode =
+    error.statusCode || error.status || (error.message === "Origin not allowed by CORS" ? 403 : 500);
+
+  res.status(statusCode).json({
+    success: false,
+    message: error.message || "Erreur serveur",
+  });
+});
+
 startServer();
+
+
