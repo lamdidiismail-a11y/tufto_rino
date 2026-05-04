@@ -114,7 +114,11 @@ const uploadProductImage = multer({
 
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: [
+      "http://localhost:5173",
+      "https://tufto-rino-frontend.vercel.app",
+      "https://tufto-rino-frontend-j1v56bbxy-lamdidiismail-a11ys-projects.vercel.app"
+    ],
     credentials: false,
   })
 );
